@@ -1,0 +1,6 @@
+<workspace>
+	<batchBuild></batchBuild>
+	<project>
+		<path>$WS_DIR$\thirdparty_metrology_demometer_g3_flash.ewp</path>
+	</project>
+</workspace>

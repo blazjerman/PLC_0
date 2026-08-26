@@ -1,0 +1,6 @@
+<workspace>
+	<batchBuild></batchBuild>
+	<project>
+		<path>$WS_DIR$\apps_adp_mac_serialized_app_flash.ewp</path>
+	</project>
+</workspace>

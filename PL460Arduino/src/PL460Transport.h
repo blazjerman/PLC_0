@@ -22,6 +22,16 @@ struct Pins {
         supplyMonitor(supplyMonitorPin), supplyGoodThreshold(supplyThreshold) {}
 };
 
+struct SpiPins {
+  int8_t sck;
+  int8_t miso;
+  int8_t mosi;
+
+  SpiPins(int8_t sckPin = -1, int8_t misoPin = -1, int8_t mosiPin = -1)
+      : sck(sckPin), miso(misoPin), mosi(mosiPin) {}
+  bool custom() const { return sck >= 0 && miso >= 0 && mosi >= 0; }
+};
+
 class Transport {
  public:
   virtual ~Transport() {}
@@ -39,6 +49,8 @@ class ArduinoTransport : public Transport {
  public:
   ArduinoTransport(SPIClass &spi, const Pins &pins,
                    uint32_t frequency = 4000000UL);
+  ArduinoTransport(SPIClass &spi, const Pins &pins, const SpiPins &spiPins,
+                   uint32_t frequency = 4000000UL);
 
   bool begin() override;
   void end() override;
@@ -55,6 +67,7 @@ class ArduinoTransport : public Transport {
  private:
   SPIClass &spi_;
   Pins pins_;
+  SpiPins spiPins_;
   uint32_t frequency_;
   bool started_;
 };

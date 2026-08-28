@@ -13,6 +13,10 @@ const uint16_t kTxConfirmFlag = 0x0001;
 const uint16_t kRxDataFlag = 0x0002;
 const uint16_t kRxParametersFlag = 0x0010;
 const uint16_t kRxParametersLength = 117;
+const uint32_t kRegisterBase = 0x80000000UL;
+const uint16_t kCrcTxRxCapability = 0x401C;
+const uint16_t kAutoDetectImpedance = 0x401E;
+const uint16_t kImpedance = 0x401F;
 
 void putLe32(uint8_t *p, uint32_t value) {
   p[0] = static_cast<uint8_t>(value);
@@ -26,6 +30,9 @@ G3TxConfig G3TxConfig::cenelecARobust() {
   G3TxConfig c;
   memset(&c, 0, sizeof(c));
   c.toneMap[0] = 0x3F;
+  // Forced + relative avoids scheduling an absolute transmission at timestamp
+  // zero, which is already in the past once firmware boot has completed.
+  c.mode = 0x03;
   c.modulation = G3Modulation::RobustBPSK;
   c.scheme = G3Scheme::Differential;
   c.delimiter = G3Delimiter::SofNoResponse;
@@ -64,6 +71,23 @@ bool G3Phy::send(const uint8_t *data, uint16_t length, const G3TxConfig &config)
   txBusy_ = true;
   txConfirmReady_ = false;
   return true;
+}
+
+bool G3Phy::enableCrc(bool enabled) {
+  const uint8_t value = enabled ? 1 : 0;
+  return device_.writeRegister(kRegisterBase + (kCrcTxRxCapability & 0x0FFFU),
+                               &value, 1);
+}
+
+bool G3Phy::setImpedance(G3Impedance impedance, bool autoDetect) {
+  const uint8_t automatic = autoDetect ? 1 : 0;
+  if (!device_.writeRegister(kRegisterBase + (kAutoDetectImpedance & 0x0FFFU),
+                             &automatic, 1)) {
+    return false;
+  }
+  const uint8_t value = static_cast<uint8_t>(impedance);
+  return device_.writeRegister(kRegisterBase + (kImpedance & 0x0FFFU),
+                               &value, 1);
 }
 
 uint16_t G3Phy::getLe16(const uint8_t *p) {

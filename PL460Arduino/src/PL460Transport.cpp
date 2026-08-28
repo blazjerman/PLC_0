@@ -4,7 +4,12 @@ namespace pl460 {
 
 ArduinoTransport::ArduinoTransport(SPIClass &spi, const Pins &pins,
                                    uint32_t frequency)
-    : spi_(spi), pins_(pins), frequency_(frequency), started_(false) {}
+    : spi_(spi), pins_(pins), spiPins_(), frequency_(frequency), started_(false) {}
+
+ArduinoTransport::ArduinoTransport(SPIClass &spi, const Pins &pins,
+                                   const SpiPins &spiPins, uint32_t frequency)
+    : spi_(spi), pins_(pins), spiPins_(spiPins), frequency_(frequency),
+      started_(false) {}
 
 bool ArduinoTransport::begin() {
   pinMode(pins_.cs, OUTPUT);
@@ -20,7 +25,16 @@ bool ArduinoTransport::begin() {
   if (pins_.thermal >= 0) pinMode(pins_.thermal, INPUT_PULLUP);
   if (pins_.supplyMonitor >= 0) pinMode(pins_.supplyMonitor, INPUT);
 
+#if defined(ARDUINO_ARCH_ESP32)
+  if (spiPins_.custom())
+    spi_.begin(spiPins_.sck, spiPins_.miso, spiPins_.mosi, pins_.cs);
+  else
+    spi_.begin();
+#else
+  // On other Arduino cores, construct/configure SPIClass with its desired
+  // peripheral pins before use. The standard SPI API has no portable remap call.
   spi_.begin();
+#endif
   started_ = true;
   return true;
 }

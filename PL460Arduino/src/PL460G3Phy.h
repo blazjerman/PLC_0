@@ -7,6 +7,7 @@ namespace pl460 {
 enum class G3Modulation : uint8_t { BPSK = 0, QPSK = 1, PSK8 = 2, RobustBPSK = 4 };
 enum class G3Scheme : uint8_t { Differential = 0, Coherent = 1 };
 enum class G3Delimiter : uint8_t { SofNoResponse = 0, SofResponse = 1, Ack = 2, Nack = 3 };
+enum class G3Impedance : uint8_t { High = 0, Low = 1, VeryLow = 2 };
 
 struct G3TxConfig {
   uint32_t startTime;
@@ -50,6 +51,8 @@ class G3Phy {
 
   bool send(const uint8_t *data, uint16_t length,
             const G3TxConfig &config = G3TxConfig::cenelecARobust());
+  bool enableCrc(bool enabled = true);
+  bool setImpedance(G3Impedance impedance, bool autoDetect = false);
   bool poll();
   bool transmissionComplete() const { return txConfirmReady_; }
   bool takeTxConfirm(G3TxConfirm &confirm);

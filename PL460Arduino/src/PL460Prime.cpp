@@ -9,7 +9,7 @@ void putLe32(uint8_t *p, uint32_t v) {
 }
 
 PrimeTxConfig::PrimeTxConfig()
-    : startTime(0), mode(0), attenuation(0), scheme(PrimeScheme::RobustDBPSK),
+    : startTime(0), mode(1), attenuation(0), scheme(PrimeScheme::RobustDBPSK),
       frameType(PrimeFrameType::TypeA), buffer(0), disableCarrierSense(false),
       carrierSenseCount(3), carrierSenseDelayMs(2) {}
 
@@ -106,4 +106,3 @@ uint16_t PrimePhy::receive(uint8_t *data, uint16_t capacity, PrimeRxInfo *info) 
 }
 
 }  // namespace pl460
-

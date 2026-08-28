@@ -12,6 +12,8 @@ Arduino boards.
 - Checks the firmware mailbox key and reads product/model/version/band data.
 - Provides raw read/write access to every firmware mailbox.
 - Provides typed G3-PLC, PRIME, and Meters & More PHY P2P transmit/receive APIs.
+- Loads Microchip's PL460-EK rev5 auxiliary-branch CENELEC-A calibration before
+  G3 transmission (line-driver selection, DACC, RMS, gain and predistortion).
 - Includes CENELEC-A/B, FCC, and multiband G3 PHY images.
 - Includes CENELEC-A/B, FCC, and multiband G3 MAC-RT images.
 - Includes PRIME, PRIME two-channel, and Meters & More PHY images.
@@ -43,20 +45,22 @@ deliberately tests the G3 physical layer.
 
 ## PL460-EK rev5 to ESP32 wiring
 
-The example pin assignment uses ESP32 VSPI defaults:
+The checked-in examples now use your ESP32 pin assignment:
 
 | PL460-EK J2 | Signal | ESP32 example |
 |---:|---|---:|
 | 2, 19 | GND | GND |
 | 20 | 3V3 logic supply | 3V3 |
-| 4 | XPL_TXEN | GPIO 26 |
-| 5 | XPL_NRST | GPIO 4 |
-| 9 | XPL_EXTIN (active low) | GPIO 27 |
-| 10 | XPL_NTHW0 (active low thermal) | GPIO 25 |
-| 15 | XPL_CS | GPIO 5 |
-| 16 | MOSI | GPIO 23 |
-| 17 | MISO | GPIO 19 |
-| 18 | SCK | GPIO 18 |
+| 4 | XPL_TXEN | GPIO 6 |
+| 5 | XPL_NRST | GPIO 3 |
+| 6 | XPL_ENABLE (optional R71) | GPIO 4 / LDO_EN |
+| 9 | XPL_EXTIN (active low) | GPIO 2 |
+| 10 | XPL_NTHW0 (active low thermal) | GPIO 7 |
+| 13 | XPL_STBY (optional R68) | GPIO 5 |
+| 15 | XPL_CS | GPIO 10 |
+| 16 | MOSI | GPIO 11 |
+| 17 | MISO | GPIO 13 |
+| 18 | SCK | GPIO 12 |
 
 J4 separately requires **15 V ±5%, 12 W** for the coupling/amplifier supply.
 Do not power J4 from the ESP32. Keep all logic at 3.3 V.
@@ -70,6 +74,18 @@ supply-monitor routing; do not assume those optional paths are connected.
 Power-line voltage is hazardous. Develop first through an isolated PLC coupling
 fixture and follow the PL460-EK user guide and local electrical-safety rules.
 
+For this non-default ESP32 SPI mapping, pass all three bus pins explicitly:
+
+```cpp
+pl460::Pins control(10, 3, 2, 6, 7);       // CS, RESET, IRQ, TX_EN, NTHW0
+pl460::SpiPins bus(12, 13, 11);             // SCK, MISO, MOSI
+pl460::ArduinoTransport transport(SPI, control, bus);
+```
+
+Set PL460 `ENABLE/LDO_EN` high and `STBY` low before `modem.begin()`. A stock
+rev5 evaluation kit already fixes ENABLE high and STBY low; its J2 versions are
+not connected unless R71 and R68 respectively are fitted.
+
 ## First test
 
 1. Copy the `PL460Arduino` directory into the Arduino libraries directory, or
@@ -80,9 +96,18 @@ fixture and follow the PL460-EK user guide and local electrical-safety rules.
 4. Select **ESP32 Dev Module**, upload, and open Serial Monitor at 115200 baud.
 5. Run `SingleBoardSelfTest` if only one modem is available. It intentionally
    does not transmit.
-6. For two boards, flash `G3PhyP2P`, `PrimeP2P`, or `MetersAndMoreP2P` with
+6. If transmission is not working, run `G3PhyFullDebug` first. It uses a forced,
+   relative-time, robust-BPSK CENELEC-A frame and does not require a receiver.
+   The sketch loads the rev5 auxiliary-branch tables, forces VLO impedance for
+   maximum test signal, and enables the PHY CRC checker. A reported receive
+   length can include one padding byte; `CRC=OK` is the integrity result.
+7. For two boards, flash `G3PhyP2P`, `PrimeP2P`, or `MetersAndMoreP2P` with
    `ROLE_SENDER=1` on one and `ROLE_SENDER=0` on the other. G3 uses Slovenia's
    CENELEC-A image.
+
+For the shortest text demonstration, use `G3HelloWorld`: upload it with
+`ROLE_SENDER=1` to one board, change the setting to `0`, and upload it to the
+other board. The sender transmits `Hello world!` every two seconds.
 
 Each firmware header is opt-in. Include only the image being used; otherwise a
 sketch can waste hundreds of kilobytes of flash.

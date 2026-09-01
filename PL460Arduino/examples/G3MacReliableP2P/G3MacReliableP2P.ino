@@ -1,10 +1,9 @@
 /*  G3 MAC — minimal software ACK test
  *
- *  Board 1 (ROLE_SENDER=1): sends frame every 3s, waits for ACK
- *  Board 2 (ROLE_SENDER=0): receives frame, prints it, sends ACK back
- *
- *  Both boards have TX enabled.
- *  No state machine, no CSMA — just phy.send + phy.receive.
+ *  Board 1 (ROLE_SENDER=1): sends frame every 3s
+ *  Board 2 (ROLE_SENDER=0): receives frame, prints it
+ *    - TX_EN is normally LOW (so LNA is connected)
+ *    - Only raises TX_EN briefly when sending ACK
  */
 
 #include <PL460.h>
@@ -44,6 +43,8 @@ void setup() {
   digitalWrite(PIN_LDO_EN, HIGH);
   pinMode(PIN_STBY, OUTPUT);
   digitalWrite(PIN_STBY, LOW);
+  pinMode(PIN_TX_EN, OUTPUT);
+  digitalWrite(PIN_TX_EN, LOW);  // start with TX off
   delay(20);
 
   Serial.println("G3 ACK test");
@@ -54,30 +55,39 @@ void setup() {
   if (!phy.setImpedance(pl460::G3Impedance::VeryLow, false)) stop("impedance");
   if (!phy.enableCrc(true)) stop("crc");
 
-  // Both boards must TX for ACK to work
-  modem.enableTransmitter(true);
+  // Sender: TX enabled.  Receiver: TX disabled (LNA connected for RX).
+  modem.enableTransmitter(ROLE_SENDER != 0);
   Serial.printf("Ready role=%s\n", ROLE_SENDER ? "SENDER" : "RECEIVER");
+}
+
+// Helper to send a frame, briefly enabling TX on the receiver
+void sendFrame(const uint8_t *data, uint16_t len) {
+  if (ROLE_SENDER) {
+    modem.enableTransmitter(true);
+    phy.send(data, len);
+  } else {
+    // Receiver: enable TX just for this send, then disable for RX
+    modem.enableTransmitter(true);
+    delay(1);
+    phy.send(data, len);
+    delay(1);
+    modem.enableTransmitter(false);
+  }
 }
 
 uint32_t lastSend = 0;
 uint32_t sentCount = 0;
-uint32_t ackCount = 0;
 
 void loop() {
-  // Call PHY poll every iteration
-  if (!phy.poll()) {
-    Serial.printf("poll fail\n");
-    delay(10);
-    return;
-  }
+  if (!phy.poll()) { delay(10); return; }
 
-  // Check TX confirm
+  // TX confirm
   pl460::G3TxConfirm cfm;
   if (phy.takeTxConfirm(cfm)) {
-    Serial.printf("TX done result=%u rms=%lu\n", cfm.result, (unsigned long)cfm.rms);
+    Serial.printf("TX done result=%u\n", cfm.result);
   }
 
-  // Check received data
+  // Received data
   if (phy.available()) {
     uint8_t data[128];
     pl460::G3RxInfo info;
@@ -85,16 +95,15 @@ void loop() {
     data[len] = 0;
     Serial.printf("RX len=%u crc=%u rssi=%u: %s\n", len, info.crcOk, info.rssi, data);
 
-    if (info.crcOk && len > 0) {
-      // Send ACK: just the byte 0x06 (ACK) back to sender
+    if (!ROLE_SENDER && info.crcOk && len > 0) {
+      // Receiver sends ACK back to sender
       uint8_t ack = 0x06;
-      phy.send(&ack, 1);
+      sendFrame(&ack, 1);
       Serial.println("-> ACK sent");
     }
   }
 
 #if ROLE_SENDER
-  // Send every 3 seconds
   if (!phy.busy() && millis() - lastSend >= 3000) {
     lastSend = millis();
     sentCount++;

@@ -64,7 +64,7 @@ void setup() {
   mac.setShortAddress(myAddr);
   mac.setPanId(0x0ABC);
   mac.setManageTxEn(true);  // G3Mac toggles TX_EN before/after every send
-  mac.setAckTimeoutMs(1000);
+  mac.setAckTimeoutMs(3000);
   mac.setMaxRetries(3);
   mac.begin();
 

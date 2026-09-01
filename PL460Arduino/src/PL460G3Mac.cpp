@@ -28,8 +28,10 @@ bool G3Mac::begin() {
   rxReady_ = false;
   rxLength_ = 0;
   retryCount_ = 0;
-  phySendStarted_ = false;
+  txCfmReady_ = false;
   txCfm_.status = MacTxStatus::Invalid;
+  phySendStarted_ = false;
+  ackWaitPhy_ = false;
   memset(&rxInfo_, 0, sizeof(rxInfo_));
   return true;
 }
@@ -63,6 +65,7 @@ bool G3Mac::send(uint16_t dstAddr, uint8_t *data, uint16_t length) {
   txCfmReady_ = false;
   txCfm_.status = MacTxStatus::Invalid;
   phySendStarted_ = false;
+  ackWaitPhy_ = false;
   state_ = State::CcaBackoff;
   stateTimer_ = millis();
   return true;
@@ -86,8 +89,9 @@ bool G3Mac::sendAck(uint16_t dstAddr, uint8_t seq) {
   G3TxConfig cfg = G3TxConfig::cenelecARobust();
   cfg.delimiter = G3Delimiter::SofNoResponse;
   bool ok = phy_.send(ackFrame, kHeaderSize, cfg);
-  if (manageTxEn_) {
-    delay(kTxEnSettleMs);
+  if (ok) {
+    ackWaitPhy_ = true;  // leave PA on until PHY TX confirm
+  } else if (manageTxEn_) {
     device_.enableTransmitter(false);
   }
   return ok;
@@ -192,6 +196,13 @@ void G3Mac::poll() {
       break;
 
     case State::WaitAck:
+      // Safety: if ACK PHY never confirmed, force PA off
+      if (ackWaitPhy_ && millis() - stateTimer_ > 3000) {
+        if (manageTxEn_) {
+          device_.enableTransmitter(false);
+          ackWaitPhy_ = false;
+        }
+      }
       if (millis() - stateTimer_ >= ackTimeoutMs_) {
         // Timeout — no ACK received
         if (manageTxEn_ && phySendStarted_) {
@@ -212,9 +223,15 @@ void G3Mac::poll() {
     phy_.takeTxConfirm(cfm);
 
     // PHY send just completed — turn off PA so LNA can hear ACK
-    if (manageTxEn_ && phySendStarted_) {
-      device_.enableTransmitter(false);
-      phySendStarted_ = false;
+    if (manageTxEn_) {
+      if (phySendStarted_) {
+        device_.enableTransmitter(false);
+        phySendStarted_ = false;
+      }
+      if (ackWaitPhy_) {
+        device_.enableTransmitter(false);
+        ackWaitPhy_ = false;
+      }
     }
 
     // Check for PHY-level failure (only relevant while waiting for ACK)

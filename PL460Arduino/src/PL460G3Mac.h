@@ -113,6 +113,9 @@ class G3Mac {
   // PHY send tracking (wait for completion before disabling TX)
   bool phySendStarted_ = false;
 
+  // ACK PHY send tracking (same pattern — don't cut PA during ACK TX)
+  bool ackWaitPhy_ = false;
+
   // RX buffer
   uint8_t rxBuffer_[PL460::kMaxMailboxPayload];
   uint16_t rxLength_ = 0;

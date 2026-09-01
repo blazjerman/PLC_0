@@ -12,10 +12,10 @@ const uint8_t kHeaderSize = 6;
 const uint8_t kFlagAckReq = 0x01;
 const uint8_t kFlagAck    = 0x02;
 
-// CCA: CSMA random backoff window (ms)
+// CSMA parameters
 const uint16_t kMinBackoffMs = 10;
 const uint16_t kMaxBackoffMs = 100;
-const uint16_t kCcaRetryLimit = 50;  // max CSMA attempts before fail
+const uint16_t kCcaRetryLimit = 50;
 
 G3Mac::G3Mac(G3Phy &phy) : phy_(phy), device_(phy.device()) {}
 
@@ -31,7 +31,6 @@ bool G3Mac::begin() {
 }
 
 uint16_t G3Mac::randomBackoff() {
-  // Simple LCG; deterministic but good enough for CSMA.
   static uint16_t rng = 1;
   rng = rng * 1103515245U + 12345U;
   return kMinBackoffMs + (rng % (kMaxBackoffMs - kMinBackoffMs));
@@ -63,10 +62,13 @@ bool G3Mac::send(uint16_t dstAddr, const uint8_t *data, uint16_t length) {
 }
 
 void G3Mac::poll() {
-  // Must call PHY poll() every iteration to update RX/TX status
+  // Must call PHY poll() every iteration to update RX/TX state
   phy_.poll();
 
-  // --- 1. Check for incoming data from PHY ---
+  // --- 1. Check for received data frames ---
+  // (PHY-level SofResponse handles ACK delivery at firmware level,
+  //  so we never send software ACK frames — that would clash with the
+  //  PHY ACK and cause both boards to deadlock.)
   if (phy_.available()) {
     uint8_t raw[PL460::kMaxMailboxPayload];
     G3RxInfo phyInfo;
@@ -77,32 +79,12 @@ void G3Mac::poll() {
                                 (static_cast<uint16_t>(raw[1]) << 8);
       const uint16_t frameSrc = static_cast<uint16_t>(raw[2]) |
                                 (static_cast<uint16_t>(raw[3]) << 8);
-      const uint8_t frameSeq = raw[4];
       const uint8_t flags = raw[5];
       const uint16_t payloadLen = rawLen - kHeaderSize;
 
-      if (flags & kFlagAck) {
-        // --- ACK frame ---
-        // Match against pending TX by destination address and sequence
-        if (state_ == State::WaitAck &&
-            frameDst == shortAddr_ &&   // ACK addressed to us
-            frameSrc == dstAddr_ &&     // from our destination
-            frameSeq == txSeq_ &&       // matching sequence
-            retryCount_ <= maxRetries_) {
-          // ACK match!
-          txCfm_.status = MacTxStatus::Success;
-          txCfm_.retries = retryCount_;
-          txCfmReady_ = true;
-          state_ = State::Idle;
-        }
-        // Don't forward ACK frames to the application
-        return;
-      }
-
-      // --- Data frame ---
-      // Check if addressed to us or broadcast
-      if (frameDst == shortAddr_ || frameDst == 0xFFFF) {
-        // Copy payload to RX buffer
+      // Data frame addressed to us?
+      if ((frameDst == shortAddr_ || frameDst == 0xFFFF) &&
+          !(flags & kFlagAck)) {  // skip software ACK frames
         const uint16_t copyLen = payloadLen < sizeof(rxBuffer_)
             ? payloadLen : sizeof(rxBuffer_);
         memcpy(rxBuffer_, raw + kHeaderSize, copyLen);
@@ -111,19 +93,7 @@ void G3Mac::poll() {
         rxInfo_.lqi = phyInfo.lqi;
         rxInfo_.snr = phyInfo.snrPayload;
         rxReady_ = true;
-
-        // Send ACK if requested
-        if (flags & kFlagAckReq) {
-          uint8_t ack[6];
-          ack[0] = static_cast<uint8_t>(frameSrc);   // dst = original sender
-          ack[1] = static_cast<uint8_t>(frameSrc >> 8);
-          ack[2] = static_cast<uint8_t>(shortAddr_); // src = us
-          ack[3] = static_cast<uint8_t>(shortAddr_ >> 8);
-          ack[4] = frameSeq;                         // same seq
-          ack[5] = kFlagAck;                         // this is an ACK
-          // Fire and forget — don't block on ACK delivery
-          (void)phy_.send(ack, sizeof(ack));
-        }
+        // No software ACK sent — PHY-level SofResponse handles it
       }
     }
   }
@@ -134,7 +104,6 @@ void G3Mac::poll() {
       break;
 
     case State::CcaBackoff:
-      // Wait for random backoff period, then check channel
       if (millis() - stateTimer_ >= randomBackoff()) {
         state_ = State::CcaWait;
         stateTimer_ = millis();
@@ -142,13 +111,9 @@ void G3Mac::poll() {
       break;
 
     case State::CcaWait:
-      // Clear channel assessment
       if (device_.canTransmit()) {
-        // Channel clear — send frame
         state_ = State::SendFrame;
-        stateTimer_ = millis();
       } else {
-        // Channel busy — re-enter backoff or fail
         if (++retryCount_ > kCcaRetryLimit) {
           txCfm_.status = MacTxStatus::ChannelAccessFailure;
           txCfm_.retries = retryCount_;
@@ -163,9 +128,11 @@ void G3Mac::poll() {
 
     case State::SendFrame:
       {
-        // Use PHY-level ACK (SofResponse) for reliability
-        pl460::G3TxConfig cfg = pl460::G3TxConfig::cenelecARobust();
-        cfg.delimiter = pl460::G3Delimiter::SofResponse;
+        // Use PHY-level ACK (SofResponse) — the PL460 firmware
+        // on the receiver auto-sends an ACK delimiter; no software
+        // ACK frame needed.
+        G3TxConfig cfg = G3TxConfig::cenelecARobust();
+        cfg.delimiter = G3Delimiter::SofResponse;
         phy_.send(txPayload_, txLength_, cfg);
       }
       retryCount_ = 0;
@@ -174,30 +141,26 @@ void G3Mac::poll() {
       break;
 
     case State::WaitAck:
+      // Wait for PHY TX confirm (which includes SofResponse result).
+      // Timeout is a safety net only.
       if (millis() - stateTimer_ >= ackTimeoutMs_) {
-        // Timeout — no ACK received
-        if (++retryCount_ <= maxRetries_) {
-          // Retransmit
-          state_ = State::CcaBackoff;
-          stateTimer_ = millis();
-        } else {
-          txCfm_.status = MacTxStatus::NoAck;
-          txCfm_.retries = retryCount_;
-          txCfmReady_ = true;
-          state_ = State::Idle;
-        }
+        // PHY never reported — force abort
+        txCfm_.status = MacTxStatus::NoAck;
+        txCfm_.retries = retryCount_;
+        txCfmReady_ = true;
+        state_ = State::Idle;
       }
       break;
   }
 
-  // 3. Check PHY TX confirm for SofResponse result
+  // --- 3. Check PHY TX confirm for SofResponse ACK result ---
   if (phy_.transmissionComplete()) {
-    pl460::G3TxConfirm cfm;
+    G3TxConfirm cfm;
     phy_.takeTxConfirm(cfm);
-    
+
     if (state_ == State::WaitAck) {
       if (cfm.result == 0) {
-        // PHY-level ACK received via SofResponse
+        // PHY-level SofResponse ACK received
         txCfm_.status = MacTxStatus::Success;
         txCfm_.retries = retryCount_;
         txCfmReady_ = true;

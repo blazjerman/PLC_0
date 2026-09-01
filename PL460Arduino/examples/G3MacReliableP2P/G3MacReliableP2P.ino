@@ -129,10 +129,6 @@ void loop() {
     uint16_t len = mac.receive(buf, sizeof(buf) - 1, &info);
     buf[len] = 0;
     Serial.printf("RX from 0x%04X: %s\n", info.srcAddr, buf);
-
-    // Echo back
-    if (!mac.busy())
-      mac.send(info.srcAddr, buf, len);
   }
 
 #if ROLE_SENDER

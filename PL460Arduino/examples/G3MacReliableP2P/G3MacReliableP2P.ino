@@ -103,7 +103,8 @@ void setup() {
   mac.setPanId(kPanId);
   mac.begin();
 
-  modem.enableTransmitter(ROLE_SENDER != 0);
+  // Both boards must have TX enabled for ACK to work
+  modem.enableTransmitter(true);
   Serial.printf("Ready. Addr=0x%04X PAN=0x%04X\n", myAddr, kPanId);
 }
 

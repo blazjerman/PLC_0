@@ -69,6 +69,11 @@ const char *txStatusName(pl460::MacTxStatus s) {
   }
 }
 
+void stop(const char *msg) {
+  Serial.printf("FAIL: %s\n", msg);
+  while (true) delay(1000);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -82,18 +87,15 @@ void setup() {
   Serial.println("PL460 G3 MAC (software MAC over PHY)");
 
   // Init PL460 + PHY firmware
-  if (!modem.begin())
-    { Serial.printf("modem: %s\\n", modem.lastErrorString()); while (true); }
+  if (!modem.begin()) stop("modem");
   if (!modem.boot(pl460::PLC_PHY_G3_CENA_IMAGE, 5000))
-    { Serial.printf("boot: %s\\n", modem.lastErrorString()); while (true); }
+    stop("boot");
   if (!pl460::configureG3CenelecARev5(modem))
-    { Serial.printf("coupling: %s\\n", modem.lastErrorString()); while (true); }
-
-  // Critical: configure TX impedance mode
+    stop("coupling");
   if (!phy.setImpedance(pl460::G3Impedance::VeryLow, false))
-    { Serial.printf("impedance: %s\\n", modem.lastErrorString()); while (true); }
+    stop("impedance");
   if (!phy.enableCrc(true))
-    { Serial.printf("crc: %s\\n", modem.lastErrorString()); while (true); }
+    stop("crc");
 
   // Configure MAC
   const uint16_t myAddr = ROLE_SENDER ? kCoordinatorAddr : kDeviceAddr;
@@ -102,7 +104,7 @@ void setup() {
   mac.begin();
 
   modem.enableTransmitter(ROLE_SENDER != 0);
-  Serial.printf("Ready. Addr=0x%04X PAN=0x%04X\\n", myAddr, kPanId);
+  Serial.printf("Ready. Addr=0x%04X PAN=0x%04X\n", myAddr, kPanId);
 }
 
 void loop() {
@@ -114,7 +116,7 @@ void loop() {
     pl460::MacTxConfirm cfm = mac.takeTxConfirm();
     if (cfm.status == pl460::MacTxStatus::Success) ++ackOk;
     else ++ackFail;
-    Serial.printf("TX %s (retries=%u) OK=%u FAIL=%u\\n",
+    Serial.printf("TX %s (retries=%u) OK=%u FAIL=%u\n",
                   txStatusName(cfm.status), cfm.retries,
                   ackOk, ackFail);
   }
@@ -125,7 +127,7 @@ void loop() {
     pl460::MacRxInfo info;
     uint16_t len = mac.receive(buf, sizeof(buf) - 1, &info);
     buf[len] = 0;
-    Serial.printf("RX from 0x%04X: %s\\n", info.srcAddr, buf);
+    Serial.printf("RX from 0x%04X: %s\n", info.srcAddr, buf);
 
     // Echo back
     if (!mac.busy())
@@ -140,7 +142,7 @@ void loop() {
     if (mac.send(kDeviceAddr,
                  reinterpret_cast<const uint8_t *>(message),
                  sizeof(message))) {
-      Serial.printf("Send #%u -> 0x%04X\\n", sendCount, kDeviceAddr);
+      Serial.printf("Send #%u -> 0x%04X\n", sendCount, kDeviceAddr);
     }
   }
 #endif

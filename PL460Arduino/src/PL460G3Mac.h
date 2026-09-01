@@ -51,7 +51,16 @@ class G3Mac {
  public:
   explicit G3Mac(PL460 &device);
 
-  // Boot MAC RT firmware and configure
+  // Simple init: boot firmware + configure addressing
+  // Use this instead of manual begin()+boot()+coupling+setAddresses
+  bool begin(const FirmwareImage &image,
+             uint16_t shortAddr,
+             uint16_t panId,
+             bool isCoordinator = false,
+             uint32_t bootTimeoutMs = 5000);
+
+  // Advanced init: just initialize MAC state after manual setup
+  // Call this if you do the boot/coupling/addressing yourself
   bool begin();
 
   // Send data to destination short address

@@ -1,4 +1,5 @@
 #include "PL460G3Mac.h"
+#include "PL460G3Coupling.h"
 #include <string.h>
 
 namespace pl460 {
@@ -21,6 +22,24 @@ G3Mac::G3Mac(PL460 &device)
       rxLength_(0) {
   memset(&lastTxCfm_, 0, sizeof(lastTxCfm_));
   memset(&lastRxInfo_, 0, sizeof(lastRxInfo_));
+}
+
+bool G3Mac::begin(const FirmwareImage &image,
+                  uint16_t shortAddr,
+                  uint16_t panId,
+                  bool isCoordinator,
+                  uint32_t bootTimeoutMs) {
+  if (!device_.begin()) return false;
+  if (!device_.boot(image, bootTimeoutMs)) return false;
+  if (!configureG3CenelecARev5(device_)) return false;
+  if (!setShortAddress(shortAddr)) return false;
+  if (!setPanId(panId)) return false;
+  if (!setCoordinator(isCoordinator)) return false;
+  device_.enableTransmitter(true);
+  txBusy_ = false;
+  txCfmReady_ = false;
+  rxReady_ = false;
+  return true;
 }
 
 bool G3Mac::begin() {

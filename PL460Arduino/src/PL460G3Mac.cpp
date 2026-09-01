@@ -72,7 +72,7 @@ void G3Mac::poll() {
     G3RxInfo phyInfo;
     uint16_t rawLen = phy_.receive(raw, sizeof(raw), &phyInfo);
 
-    if (rawLen >= kHeaderSize) {
+    if (rawLen >= kHeaderSize && phyInfo.crcOk == 1) {
       const uint16_t frameDst = static_cast<uint16_t>(raw[0]) |
                                 (static_cast<uint16_t>(raw[1]) << 8);
       const uint16_t frameSrc = static_cast<uint16_t>(raw[2]) |

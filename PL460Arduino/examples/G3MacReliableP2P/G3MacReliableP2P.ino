@@ -89,6 +89,10 @@ void setup() {
   if (!pl460::configureG3CenelecARev5(modem))
     { Serial.printf("coupling: %s\\n", modem.lastErrorString()); while (true); }
 
+  // Critical: configure TX impedance mode
+  if (!phy.setImpedance(pl460::G3Impedance::VeryLow, false))
+    { Serial.printf("impedance: %s\\n", modem.lastErrorString()); while (true); }
+
   // Configure MAC
   const uint16_t myAddr = ROLE_SENDER ? kCoordinatorAddr : kDeviceAddr;
   mac.setShortAddress(myAddr);

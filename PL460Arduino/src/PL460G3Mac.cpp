@@ -28,6 +28,7 @@ bool G3Mac::begin() {
   rxReady_ = false;
   rxLength_ = 0;
   retryCount_ = 0;
+  phySendStarted_ = false;
   txCfm_.status = MacTxStatus::Invalid;
   memset(&rxInfo_, 0, sizeof(rxInfo_));
   return true;
@@ -61,6 +62,7 @@ bool G3Mac::send(uint16_t dstAddr, uint8_t *data, uint16_t length) {
   retryCount_ = 0;
   txCfmReady_ = false;
   txCfm_.status = MacTxStatus::Invalid;
+  phySendStarted_ = false;
   state_ = State::CcaBackoff;
   stateTimer_ = millis();
   return true;
@@ -174,7 +176,7 @@ void G3Mac::poll() {
 
     case State::SendFrame:
       {
-        // Enable TX (if managed), send frame, then disable TX to hear ACK
+        // Enable TX (if managed), then start the PHY send
         if (manageTxEn_) {
           device_.enableTransmitter(true);
           delay(kTxEnSettleMs);
@@ -182,10 +184,7 @@ void G3Mac::poll() {
         G3TxConfig cfg = G3TxConfig::cenelecARobust();
         cfg.delimiter = G3Delimiter::SofNoResponse;
         phy_.send(txPayload_, txLength_, cfg);
-        if (manageTxEn_) {
-          delay(kTxEnSettleMs);
-          device_.enableTransmitter(false);
-        }
+        phySendStarted_ = true;
       }
       retryCount_ = 0;
       state_ = State::WaitAck;
@@ -195,6 +194,10 @@ void G3Mac::poll() {
     case State::WaitAck:
       if (millis() - stateTimer_ >= ackTimeoutMs_) {
         // Timeout — no ACK received
+        if (manageTxEn_ && phySendStarted_) {
+          device_.enableTransmitter(false);
+          phySendStarted_ = false;
+        }
         txCfm_.status = MacTxStatus::NoAck;
         txCfm_.retries = retryCount_;
         txCfmReady_ = true;
@@ -203,14 +206,19 @@ void G3Mac::poll() {
       break;
   }
 
-  // --- 3. Check PHY TX confirm (for completion of data sends) ---
+  // --- 3. Check PHY TX confirm (wait for PHY send to finish before disabling TX) ---
   if (phy_.transmissionComplete()) {
     G3TxConfirm cfm;
     phy_.takeTxConfirm(cfm);
-    // We're in software ACK mode now, so PHY result is about the send itself
-    // (not about the SofResponse ACK). If it failed, treat as channel error.
+
+    // PHY send just completed — turn off PA so LNA can hear ACK
+    if (manageTxEn_ && phySendStarted_) {
+      device_.enableTransmitter(false);
+      phySendStarted_ = false;
+    }
+
+    // Check for PHY-level failure (only relevant while waiting for ACK)
     if (state_ == State::WaitAck && cfm.result != 0) {
-      // PHY send itself failed — don't wait for ACK
       if (++retryCount_ <= maxRetries_) {
         state_ = State::CcaBackoff;
         stateTimer_ = millis();

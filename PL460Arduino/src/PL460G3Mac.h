@@ -110,6 +110,9 @@ class G3Mac {
   bool txCfmReady_ = false;
   MacTxConfirm txCfm_;
 
+  // PHY send tracking (wait for completion before disabling TX)
+  bool phySendStarted_ = false;
+
   // RX buffer
   uint8_t rxBuffer_[PL460::kMaxMailboxPayload];
   uint16_t rxLength_ = 0;

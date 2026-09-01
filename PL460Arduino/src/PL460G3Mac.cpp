@@ -32,6 +32,8 @@ bool G3Mac::begin() {
   txCfm_.status = MacTxStatus::Invalid;
   phySendStarted_ = false;
   ackWaitPhy_ = false;
+  lastRxSrc_ = 0;
+  lastRxSeq_ = 0;
   memset(&rxInfo_, 0, sizeof(rxInfo_));
   return true;
 }
@@ -131,17 +133,24 @@ void G3Mac::poll() {
 
         } else {
           // --- Data frame ---
-          const uint16_t payloadLen = rawLen - kHeaderSize;
-          const uint16_t copyLen = payloadLen < sizeof(rxBuffer_)
-              ? payloadLen : sizeof(rxBuffer_);
-          memcpy(rxBuffer_, raw + kHeaderSize, copyLen);
-          rxLength_ = copyLen;
-          rxReady_ = true;
-          rxInfo_.srcAddr = frameSrc;
-          rxInfo_.lqi = phyInfo.lqi;
-          rxInfo_.snr = phyInfo.snrPayload;
+          const bool isDup = (frameSrc == lastRxSrc_ && frameSeq == lastRxSeq_);
 
-          // Send software ACK if requested
+          if (!isDup) {
+            // New frame — deliver to application
+            const uint16_t payloadLen = rawLen - kHeaderSize;
+            const uint16_t copyLen = payloadLen < sizeof(rxBuffer_)
+                ? payloadLen : sizeof(rxBuffer_);
+            memcpy(rxBuffer_, raw + kHeaderSize, copyLen);
+            rxLength_ = copyLen;
+            rxReady_ = true;
+            rxInfo_.srcAddr = frameSrc;
+            rxInfo_.lqi = phyInfo.lqi;
+            rxInfo_.snr = phyInfo.snrPayload;
+            lastRxSrc_ = frameSrc;
+            lastRxSeq_ = frameSeq;
+          }
+
+          // Always send ACK (even for duplicates — sender expects it)
           if (flags & kFlagAckReq) {
             sendAck(frameSrc, frameSeq);
           }

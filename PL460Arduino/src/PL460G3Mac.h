@@ -121,6 +121,10 @@ class G3Mac {
   uint16_t rxLength_ = 0;
   bool rxReady_ = false;
   MacRxInfo rxInfo_;
+
+  // Dedup: last seen frame source + seq
+  uint16_t lastRxSrc_ = 0;
+  uint8_t lastRxSeq_ = 0;
 };
 
 }  // namespace pl460

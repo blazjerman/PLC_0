@@ -5,7 +5,7 @@
 
 namespace pl460 {
 
-// TX confirmation
+// TX confirmation result
 enum class MacTxStatus : uint8_t {
   Success = 0,
   ChannelAccessFailure = 1,
@@ -26,48 +26,63 @@ struct MacRxInfo {
 };
 
 // Software G3 MAC layer over G3Phy.
-// Handles: CSMA/CA, addressing, ACK/NACK, retransmission, frame sequencing.
+// Handles: CSMA/CA, ACK/retransmission via software ACK frames,
+//          16-bit addressing, automatic TX_EN management.
+//
+// TX_EN protocol (for PL460-EK rev5):
+//   - call setManageTxEn(true) to have G3Mac toggle TX_EN automatically:
+//     * enable before TX, disable after TX (so LNA is connected for RX)
+//   - setManageTxEn(false) if you manage TX_EN externally
+//   - The caller must still set enableTransmitter(true) at init on the sender
+//     (G3Mac only toggles during TX operations, not the static setting)
 class G3Mac {
  public:
   explicit G3Mac(G3Phy &phy);
 
-  // Configure addressing. Must call before begin().
+  // Addressing and PAN config
   void setShortAddress(uint16_t addr) { shortAddr_ = addr; }
   void setPanId(uint16_t panId) { panId_ = panId; }
 
-  // Initialize MAC layer.
+  // If true, G3Mac toggles TX_EN before/after ACK sends
+  void setManageTxEn(bool manage) { manageTxEn_ = manage; }
+
+  // Initialize MAC
   bool begin();
 
   // Send data to destination. Handles CSMA/CA + ACK + retry.
   // Returns false if busy or invalid args.
-  bool send(uint16_t dstAddr, const uint8_t *data, uint16_t length);
+  bool send(uint16_t dstAddr, uint8_t *data, uint16_t length);
 
   // Must call every loop iteration.
   void poll();
 
-  // --- Status queries ---
+  // Status queries
   bool busy() const { return state_ != State::Idle; }
   bool available() const { return rxReady_; }
-  bool transmissionComplete() const { return txCfmReady_; }
   MacTxConfirm takeTxConfirm();
 
   // Read received payload. Returns length copied.
   uint16_t receive(uint8_t *data, uint16_t capacity, MacRxInfo *info = nullptr);
 
-  // --- Configuration ---
+  // Configuration
   void setMaxRetries(uint8_t r) { maxRetries_ = r; }
   void setAckTimeoutMs(uint16_t t) { ackTimeoutMs_ = t; }
+
+  uint16_t shortAddress() const { return shortAddr_; }
 
  private:
   enum class State : uint8_t {
     Idle,
-    CcaWait,
     CcaBackoff,
+    CcaWait,
     SendFrame,
     WaitAck,
   };
 
   static uint16_t randomBackoff();
+
+  // Send an ACK frame (internal — bypasses send() for ACK only)
+  bool sendAck(uint16_t dstAddr, uint8_t seq);
 
   G3Phy &phy_;
   PL460 &device_;
@@ -80,6 +95,7 @@ class G3Mac {
   // Config
   uint8_t maxRetries_ = 3;
   uint16_t ackTimeoutMs_ = 500;
+  bool manageTxEn_ = false;
 
   // TX state machine
   State state_ = State::Idle;

@@ -1,13 +1,16 @@
-/*  G3 MAC — minimal software ACK test
+/*  G3 MAC — Reliable P2P with software ACK and automatic TX_EN management
  *
- *  Board 1 (ROLE_SENDER=1): sends frame every 3s
- *  Board 2 (ROLE_SENDER=0): receives frame, prints it
- *    - TX_EN is normally LOW (so LNA is connected)
- *    - Only raises TX_EN briefly when sending ACK
+ *  G3Mac manages TX_EN internally (toggle before/after each send).
+ *  This means:
+ *    - Sender: PA on during TX, off during RX (can hear ACK)
+ *    - Receiver: PA off during RX (LNA connected), on briefly for ACK
+ *
+ *  Flash first board with ROLE_SENDER=1, second with ROLE_SENDER=0.
  */
 
 #include <PL460.h>
 #include <PL460G3Phy.h>
+#include <PL460G3Mac.h>
 #include <PL460G3Coupling.h>
 #include <firmware/PLC_PHY_G3_CENA.h>
 
@@ -29,6 +32,11 @@ pl460::SpiPins spi(PIN_SCK, PIN_MISO, PIN_MOSI);
 pl460::ArduinoTransport transport(SPI, pins, spi, 2000000UL);
 pl460::PL460 modem(transport);
 pl460::G3Phy phy(modem);
+pl460::G3Mac mac(phy);
+
+// Addressing
+const uint16_t myAddr = ROLE_SENDER ? 0x0001 : 0x10F2;
+const uint16_t peerAddr = ROLE_SENDER ? 0x10F2 : 0x0001;
 
 void stop(const char *msg) {
   Serial.printf("FAIL: %s\n", msg);
@@ -39,15 +47,12 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(PIN_LDO_EN, OUTPUT);
-  digitalWrite(PIN_LDO_EN, HIGH);
-  pinMode(PIN_STBY, OUTPUT);
-  digitalWrite(PIN_STBY, LOW);
-  pinMode(PIN_TX_EN, OUTPUT);
-  digitalWrite(PIN_TX_EN, LOW);  // start with TX off
+  pinMode(PIN_LDO_EN, OUTPUT);  digitalWrite(PIN_LDO_EN, HIGH);
+  pinMode(PIN_STBY, OUTPUT);    digitalWrite(PIN_STBY, LOW);
+  pinMode(PIN_TX_EN, OUTPUT);   digitalWrite(PIN_TX_EN, LOW);
   delay(20);
 
-  Serial.println("G3 ACK test");
+  Serial.println("G3MAC P2P test");
 
   if (!modem.begin()) stop("modem");
   if (!modem.boot(pl460::PLC_PHY_G3_CENA_IMAGE, 5000)) stop("boot");
@@ -55,66 +60,57 @@ void setup() {
   if (!phy.setImpedance(pl460::G3Impedance::VeryLow, false)) stop("impedance");
   if (!phy.enableCrc(true)) stop("crc");
 
-  // Sender: TX enabled.  Receiver: TX disabled (LNA connected for RX).
-  modem.enableTransmitter(ROLE_SENDER != 0);
-  Serial.printf("Ready role=%s\n", ROLE_SENDER ? "SENDER" : "RECEIVER");
-}
+  // MAC config
+  mac.setShortAddress(myAddr);
+  mac.setPanId(0x0ABC);
+  mac.setManageTxEn(true);  // G3Mac toggles TX_EN before/after every send
+  mac.setAckTimeoutMs(1000);
+  mac.setMaxRetries(3);
+  mac.begin();
 
-// Helper to send a frame, briefly enabling TX on the receiver
-void sendFrame(const uint8_t *data, uint16_t len) {
-  if (ROLE_SENDER) {
-    modem.enableTransmitter(true);
-    phy.send(data, len);
-  } else {
-    // Receiver: enable TX just for this send, then disable for RX
-    modem.enableTransmitter(true);
-    delay(1);
-    phy.send(data, len);
-    delay(1);
-    modem.enableTransmitter(false);
-  }
+  Serial.printf("Ready addr=0x%04X role=%s\n", myAddr,
+                ROLE_SENDER ? "SENDER" : "RECEIVER");
 }
 
 uint32_t lastSend = 0;
 uint32_t sentCount = 0;
 
 void loop() {
-  if (!phy.poll()) { delay(10); return; }
-
-  // TX confirm
-  pl460::G3TxConfirm cfm;
-  if (phy.takeTxConfirm(cfm)) {
-    Serial.printf("TX done result=%u\n", cfm.result);
-  }
-
-  // Received data
-  if (phy.available()) {
-    uint8_t data[128];
-    pl460::G3RxInfo info;
-    uint16_t len = phy.receive(data, sizeof(data) - 1, &info);
-    data[len] = 0;
-    Serial.printf("RX len=%u crc=%u rssi=%u: %s\n", len, info.crcOk, info.rssi, data);
-
-    if (!ROLE_SENDER && info.crcOk && len > 0) {
-      // Receiver sends ACK back to sender
-      uint8_t ack = 0x06;
-      sendFrame(&ack, 1);
-      Serial.println("-> ACK sent");
-    }
-  }
+  mac.poll();
 
 #if ROLE_SENDER
-  if (!phy.busy() && millis() - lastSend >= 3000) {
+  // --- Sender ---
+  if (!mac.busy() && millis() - lastSend >= 3000) {
     lastSend = millis();
     sentCount++;
     const char msg[] = "Hello";
-    if (phy.send((const uint8_t*)msg, sizeof(msg))) {
-      Serial.printf("SEND #%u\n", sentCount);
+    if (mac.send(peerAddr, (uint8_t*)msg, sizeof(msg))) {
+      Serial.printf("Send #%u\n", sentCount);
     } else {
-      Serial.printf("SEND FAIL: %s\n", modem.lastErrorString());
+      Serial.printf("Send FAIL (busy?)\n");
     }
+  }
+
+  pl460::MacTxConfirm cfm = mac.takeTxConfirm();
+  if (cfm.status != pl460::MacTxStatus::Invalid) {
+    if (cfm.status == pl460::MacTxStatus::Success) {
+      Serial.printf("ACK OK retries=%u\n", cfm.retries);
+    } else {
+      Serial.printf("ACK FAIL status=%u retries=%u\n",
+                    (uint8_t)cfm.status, cfm.retries);
+    }
+  }
+
+#else
+  // --- Receiver ---
+  if (mac.available()) {
+    uint8_t data[128];
+    pl460::MacRxInfo info;
+    uint16_t len = mac.receive(data, sizeof(data) - 1, &info);
+    data[len] = 0;
+    Serial.printf("RX from 0x%04X len=%u: %s\n", info.srcAddr, len, data);
   }
 #endif
 
-  delay(2);
+  delay(5);
 }

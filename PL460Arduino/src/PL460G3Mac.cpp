@@ -162,8 +162,12 @@ void G3Mac::poll() {
       break;
 
     case State::SendFrame:
-      // Send the frame over PHY
-      phy_.send(txPayload_, txLength_);
+      {
+        // Use PHY-level ACK (SofResponse) for reliability
+        pl460::G3TxConfig cfg = pl460::G3TxConfig::cenelecARobust();
+        cfg.delimiter = pl460::G3Delimiter::SofResponse;
+        phy_.send(txPayload_, txLength_, cfg);
+      }
       retryCount_ = 0;
       state_ = State::WaitAck;
       stateTimer_ = millis();
@@ -186,10 +190,31 @@ void G3Mac::poll() {
       break;
   }
 
-  // 3. Consume PHY TX confirmation
+  // 3. Check PHY TX confirm for SofResponse result
   if (phy_.transmissionComplete()) {
-    G3TxConfirm cfm;
-    (void)phy_.takeTxConfirm(cfm);
+    pl460::G3TxConfirm cfm;
+    phy_.takeTxConfirm(cfm);
+    
+    if (state_ == State::WaitAck) {
+      if (cfm.result == 0) {
+        // PHY-level ACK received via SofResponse
+        txCfm_.status = MacTxStatus::Success;
+        txCfm_.retries = retryCount_;
+        txCfmReady_ = true;
+        state_ = State::Idle;
+      } else {
+        // No PHY-level ACK — retransmit
+        if (++retryCount_ <= maxRetries_) {
+          state_ = State::CcaBackoff;
+          stateTimer_ = millis();
+        } else {
+          txCfm_.status = MacTxStatus::NoAck;
+          txCfm_.retries = retryCount_;
+          txCfmReady_ = true;
+          state_ = State::Idle;
+        }
+      }
+    }
   }
 }
 

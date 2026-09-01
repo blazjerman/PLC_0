@@ -63,6 +63,9 @@ bool G3Mac::send(uint16_t dstAddr, const uint8_t *data, uint16_t length) {
 }
 
 void G3Mac::poll() {
+  // Must call PHY poll() every iteration to update RX/TX status
+  phy_.poll();
+
   // --- 1. Check for incoming data from PHY ---
   if (phy_.available()) {
     uint8_t raw[PL460::kMaxMailboxPayload];

@@ -28,7 +28,7 @@ bool G3Mac::begin() {
   rxReady_ = false;
   rxLength_ = 0;
   retryCount_ = 0;
-  memset(&txCfm_, 0, sizeof(txCfm_));
+  txCfm_.status = MacTxStatus::Invalid;
   memset(&rxInfo_, 0, sizeof(rxInfo_));
   return true;
 }
@@ -59,6 +59,8 @@ bool G3Mac::send(uint16_t dstAddr, uint8_t *data, uint16_t length) {
   memcpy(p, data, length);
 
   retryCount_ = 0;
+  txCfmReady_ = false;
+  txCfm_.status = MacTxStatus::Invalid;
   state_ = State::CcaBackoff;
   stateTimer_ = millis();
   return true;
@@ -232,8 +234,14 @@ uint16_t G3Mac::receive(uint8_t *data, uint16_t capacity, MacRxInfo *info) {
 }
 
 MacTxConfirm G3Mac::takeTxConfirm() {
-  MacTxConfirm cfm = txCfm_;
-  txCfmReady_ = false;
+  MacTxConfirm cfm;
+  cfm.status = MacTxStatus::Invalid;
+  cfm.retries = 0;
+  if (txCfmReady_) {
+    cfm = txCfm_;
+    txCfmReady_ = false;
+    txCfm_.status = MacTxStatus::Invalid;
+  }
   return cfm;
 }
 

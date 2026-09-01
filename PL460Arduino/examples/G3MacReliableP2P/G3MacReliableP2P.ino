@@ -80,6 +80,17 @@ void loop() {
 
 #if ROLE_SENDER
   // --- Sender ---
+  // Read TX confirm FIRST (before send() clears it)
+  pl460::MacTxConfirm cfm = mac.takeTxConfirm();
+  if (cfm.status != pl460::MacTxStatus::Invalid) {
+    if (cfm.status == pl460::MacTxStatus::Success) {
+      Serial.printf("ACK OK retries=%u\n", cfm.retries);
+    } else {
+      Serial.printf("ACK FAIL status=%u retries=%u\n",
+                    (uint8_t)cfm.status, cfm.retries);
+    }
+  }
+
   if (!mac.busy() && millis() - lastSend >= 3000) {
     lastSend = millis();
     sentCount++;
@@ -88,16 +99,6 @@ void loop() {
       Serial.printf("Send #%u\n", sentCount);
     } else {
       Serial.printf("Send FAIL (busy?)\n");
-    }
-  }
-
-  pl460::MacTxConfirm cfm = mac.takeTxConfirm();
-  if (cfm.status != pl460::MacTxStatus::Invalid) {
-    if (cfm.status == pl460::MacTxStatus::Success) {
-      Serial.printf("ACK OK retries=%u\n", cfm.retries);
-    } else {
-      Serial.printf("ACK FAIL status=%u retries=%u\n",
-                    (uint8_t)cfm.status, cfm.retries);
     }
   }
 

@@ -1,9 +1,14 @@
-/*  G3 MAC RT — Full protocol example (simple init)
+/*  G3 MAC — Software MAC over G3 Phy
  *
- *  Minimal setup using G3Mac::begin(image, addr, panId, isCoordinator).
+ *  Lightweight MAC layer providing:
+ *    - 16-bit addressing (src/dst)
+ *    - CSMA/CA (listen before talk + random backoff)
+ *    - ACK/NACK with retransmission (up to 3 retries)
+ *    - Frame sequencing (duplicate detection)
+ *    - Automatic ACK response
  *
- *  Boots PL460 with G3 MAC RT firmware → configures coupling →
- *  sets address and PAN → enables transmitter — in a single call.
+ *  Uses the existing G3Phy (which handles CRC, modulation, hardware TX/RX)
+ *  and adds protocols in software on the Arduino host.
  *
  *  Wiring (PL460-EK rev5):
  *    CS=10, MOSI=11, MISO=13, SCK=12, IRQ=2, RST=3
@@ -12,8 +17,11 @@
  *  Upload with ROLE_SENDER=1 to coordinator, 0 to end device.
  */
 
+#include <PL460.h>
+#include <PL460G3Phy.h>
+#include <PL460G3Coupling.h>
 #include <PL460G3Mac.h>
-#include <firmware/G3_MAC_RT_CENA.h>
+#include <firmware/PLC_PHY_G3_CENA.h>
 
 #define ROLE_SENDER 1
 
@@ -29,24 +37,35 @@
 #define PIN_NTHW0    7
 
 const uint16_t kCoordinatorAddr = 0x0001;
-const uint16_t kDeviceAddr = 0x0002;
+const uint16_t kDeviceAddr = 0x10F2;
 const uint16_t kPanId = 0x0ABC;
 
+// 1. Transport
 pl460::Pins controlPins(PIN_CS, PIN_RESET, PIN_IRQ, PIN_TX_EN, PIN_NTHW0);
 pl460::SpiPins spiPins(PIN_SCK, PIN_MISO, PIN_MOSI);
 pl460::ArduinoTransport transport(SPI, controlPins, spiPins, 2000000UL);
-pl460::PL460 modem(transport);
-pl460::G3Mac mac(modem);
 
-static const char message[] = "Hello from G3 MAC RT!";
+// 2. PL460 device
+pl460::PL460 modem(transport);
+
+// 3. G3 PHY (handles CRC, modulation, raw frame send/receive)
+pl460::G3Phy phy(modem);
+
+// 4. G3 MAC (handles addressing, CSMA/CA, ACK, retransmission)
+pl460::G3Mac mac(phy);
+
+static const char message[] = "Hello from G3 MAC!";
 uint32_t lastSend = 0;
+uint32_t sendCount = 0;
+uint32_t ackOk = 0;
+uint32_t ackFail = 0;
 
 const char *txStatusName(pl460::MacTxStatus s) {
   switch (s) {
-    case pl460::MacTxStatus::Success:            return "SUCCESS";
-    case pl460::MacTxStatus::ChannelAccessFailure: return "CHANNEL";
-    case pl460::MacTxStatus::NoAck:              return "NO_ACK";
-    default:                                     return "?";
+    case pl460::MacTxStatus::Success:              return "OK";
+    case pl460::MacTxStatus::ChannelAccessFailure: return "BUSY";
+    case pl460::MacTxStatus::NoAck:                return "NO_ACK";
+    default:                                       return "?";
   }
 }
 
@@ -60,45 +79,63 @@ void setup() {
   digitalWrite(PIN_STBY, LOW);
   delay(20);
 
-  Serial.println("PL460 G3 MAC RT");
+  Serial.println("PL460 G3 MAC (software MAC over PHY)");
 
-  // Single init call — boots firmware, configures coupling, sets address/PAN
+  // Init PL460 + PHY firmware
+  if (!modem.begin())
+    { Serial.printf("modem: %s\\n", modem.lastErrorString()); while (true); }
+  if (!modem.boot(pl460::PLC_PHY_G3_CENA_IMAGE, 5000))
+    { Serial.printf("boot: %s\\n", modem.lastErrorString()); while (true); }
+  if (!pl460::configureG3CenelecARev5(modem))
+    { Serial.printf("coupling: %s\\n", modem.lastErrorString()); while (true); }
+
+  // Configure MAC
   const uint16_t myAddr = ROLE_SENDER ? kCoordinatorAddr : kDeviceAddr;
-  if (!mac.begin(pl460::G3_MAC_RT_CENA_IMAGE, myAddr, kPanId, ROLE_SENDER)) {
-    Serial.printf("Init failed: %s\n", modem.lastErrorString());
-    while (true) delay(1000);
-  }
+  mac.setShortAddress(myAddr);
+  mac.setPanId(kPanId);
+  mac.begin();
 
-  Serial.printf("Ready. Addr=0x%04X PAN=0x%04X\n", myAddr, kPanId);
+  modem.enableTransmitter(ROLE_SENDER != 0);
+  Serial.printf("Ready. Addr=0x%04X PAN=0x%04X\\n", myAddr, kPanId);
 }
 
 void loop() {
-  if (!mac.poll()) {
-    Serial.printf("Poll: %s\n", modem.lastErrorString());
-    delay(100);
-    return;
-  }
+  // MAC state machine must run every iteration
+  mac.poll();
 
+  // Handle TX confirmations
   if (mac.transmissionComplete()) {
-    auto cfm = mac.takeTxConfirm();
-    Serial.printf("TX %s RMS=%lu\n",
-                  txStatusName(cfm.status), (unsigned long)cfm.rms);
+    pl460::MacTxConfirm cfm = mac.takeTxConfirm();
+    if (cfm.status == pl460::MacTxStatus::Success) ++ackOk;
+    else ++ackFail;
+    Serial.printf("TX %s (retries=%u) OK=%u FAIL=%u\\n",
+                  txStatusName(cfm.status), cfm.retries,
+                  ackOk, ackFail);
   }
 
-#if ROLE_SENDER
-  if (!mac.busy() && millis() - lastSend >= 2000) {
-    lastSend = millis();
-    mac.send(kDeviceAddr,
-             reinterpret_cast<const uint8_t *>(message), sizeof(message));
-  }
-#else
+  // Handle received data
   if (mac.available()) {
     uint8_t buf[256];
     pl460::MacRxInfo info;
     uint16_t len = mac.receive(buf, sizeof(buf) - 1, &info);
     buf[len] = 0;
-    Serial.printf("RX from 0x%04X: %s\n", info.srcAddr, buf);
-    mac.send(info.srcAddr, buf, len);
+    Serial.printf("RX from 0x%04X: %s\\n", info.srcAddr, buf);
+
+    // Echo back
+    if (!mac.busy())
+      mac.send(info.srcAddr, buf, len);
+  }
+
+#if ROLE_SENDER
+  // Send every 3 seconds
+  if (!mac.busy() && millis() - lastSend >= 3000) {
+    lastSend = millis();
+    ++sendCount;
+    if (mac.send(kDeviceAddr,
+                 reinterpret_cast<const uint8_t *>(message),
+                 sizeof(message))) {
+      Serial.printf("Send #%u -> 0x%04X\\n", sendCount, kDeviceAddr);
+    }
   }
 #endif
 }

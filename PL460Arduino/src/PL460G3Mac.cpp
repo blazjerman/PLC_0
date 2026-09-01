@@ -1,243 +1,208 @@
 #include "PL460G3Mac.h"
-#include "PL460G3Coupling.h"
 #include <string.h>
 
 namespace pl460 {
-namespace {
 
-const uint32_t kRegisterBase = 0x80000000UL;
+// MAC frame header format (over-the-wire)
+// [DST_LO][DST_HI][SRC_LO][SRC_HI][SEQ][FLAGS][PAYLOAD...]
+// Overhead: 6 bytes
+const uint8_t kHeaderSize = 6;
 
-// Register offset helpers
-uint32_t regAddr(uint16_t pibId) {
-  return kRegisterBase + (pibId & 0x0FFFU);
-}
+// Flags
+const uint8_t kFlagAckReq = 0x01;
+const uint8_t kFlagAck    = 0x02;
 
-// MAC RT PIB register IDs (from Microchip G3 MAC RT SDK)
-const uint16_t kPibShortAddress     = 0x0021;  // 16-bit short address
-const uint16_t kPibPanId            = 0x0022;  // 16-bit PAN identifier
-const uint16_t kPibCoordinator      = 0x001E;  // Coordinator (set/clear)
-const uint16_t kPibTxCoil           = 0x0114;  // TX coil driver config
-const uint16_t kPibAgcConfig        = 0x0100;  // AGC auto-detection
-const uint16_t kPibRxFcFilter       = 0x0200;  // RX frame control filter
-const uint16_t kPibPromiscuous      = 0x0201;  // Promiscuous mode enable
-const uint16_t kPibAutoAck          = 0x0202;  // Auto ACK enable
+// CCA: CSMA random backoff window (ms)
+const uint16_t kMinBackoffMs = 10;
+const uint16_t kMaxBackoffMs = 100;
+const uint16_t kCcaRetryLimit = 50;  // max CSMA attempts before fail
 
-}  // namespace
-
-G3Mac::G3Mac(PL460 &device)
-    : device_(device),
-      txBusy_(false),
-      txCfmReady_(false),
-      rxReady_(false),
-      rxLength_(0) {
-  memset(&lastTxCfm_, 0, sizeof(lastTxCfm_));
-  memset(&lastRxInfo_, 0, sizeof(lastRxInfo_));
-}
-
-bool G3Mac::begin(const FirmwareImage &image,
-                  uint16_t shortAddr,
-                  uint16_t panId,
-                  bool isCoordinator,
-                  uint32_t bootTimeoutMs) {
-  if (!device_.begin()) return false;
-  if (!device_.boot(image, bootTimeoutMs)) return false;
-
-  // Configure analog front-end (same calibration as PHY mode)
-  if (!configureG3CenelecARev5(device_)) return false;
-
-  // Enable promiscuous mode so we receive all frames (for pairing)
-  // In production you would disable this.
-  uint8_t promisc = 1;
-  device_.writeRegister(regAddr(kPibPromiscuous), &promisc, 1);
-
-  // Auto ACK - hardware generates ACKs automatically
-  uint8_t autoAck = 1;
-  device_.writeRegister(regAddr(kPibAutoAck), &autoAck, 1);
-
-  // Set addressing
-  if (!setShortAddress(shortAddr)) return false;
-  if (!setPanId(panId)) return false;
-  if (!setCoordinator(isCoordinator)) return false;
-
-  device_.enableTransmitter(true);
-  txBusy_ = false;
-  txCfmReady_ = false;
-  rxReady_ = false;
-  return true;
-}
+G3Mac::G3Mac(G3Phy &phy) : phy_(phy), device_(phy.device()) {}
 
 bool G3Mac::begin() {
-  txBusy_ = false;
+  state_ = State::Idle;
   txCfmReady_ = false;
   rxReady_ = false;
+  rxLength_ = 0;
+  retryCount_ = 0;
+  memset(&txCfm_, 0, sizeof(txCfm_));
+  memset(&rxInfo_, 0, sizeof(rxInfo_));
   return true;
 }
 
-// MAC RT TX format:
-//   [len_lo][len_hi][payload...]
-// The MAC RT firmware on the PL460 handles:
-//   - Frame control + sequence number
-//   - Source/dest addressing (from PIB)
-//   - ACK request
-//   - CSMA/CA
-//   - Retransmission
+uint16_t G3Mac::randomBackoff() {
+  // Simple LCG; deterministic but good enough for CSMA.
+  static uint16_t rng = 1;
+  rng = rng * 1103515245U + 12345U;
+  return kMinBackoffMs + (rng % (kMaxBackoffMs - kMinBackoffMs));
+}
+
 bool G3Mac::send(uint16_t dstAddr, const uint8_t *data, uint16_t length) {
-  if (!data || !length || length > 400 || txBusy_) return false;
-  if (!device_.canTransmit()) return false;
+  if (!data || !length || length > PL460::kMaxMailboxPayload - kHeaderSize)
+    return false;
+  if (state_ != State::Idle) return false;
 
-  // The MAC RT firmware on the PL460 needs a complete MAC 802.15.4 frame.
-  // We build: FC(2) + Seq(1) + DestPAN(2) + Dest(2) + Src(2) + Payload
-  //
-  // Frame types are per G3-PLC (ITU-T G.9903) / IEEE 802.15.4:
-  //   FC[0:2]   = 001 (Data frame)
-  //   FC[5]     = 1   (ACK request)
-  //   FC[6]     = 1   (PAN ID compression)
-  //   FC[10:11] = 10  (Dest addressing: short)
-  //   FC[14:15] = 10  (Src addressing: short)
+  dstAddr_ = dstAddr;
+  txLength_ = length + kHeaderSize;
+  txSeq_ = seqNum_++;
 
-  uint8_t wire[512];
-  uint8_t *p = wire;
-
-  // Frame Control
-  const uint16_t fc = 0x61C1;  // Data + ACK+ PANcomp + short dest + short src
-  *p++ = static_cast<uint8_t>(fc);
-  *p++ = static_cast<uint8_t>(fc >> 8);
-
-  // Sequence number (firmware may ignore/override)
-  *p++ = 0;
-
-  // Dest PAN ID (broadcast PAN unless configured otherwise)
-  *p++ = 0xFF;
-  *p++ = 0xFF;
-
-  // Dest address (short)
+  // Build MAC frame header
+  uint8_t *p = txPayload_;
   *p++ = static_cast<uint8_t>(dstAddr);
   *p++ = static_cast<uint8_t>(dstAddr >> 8);
-
-  // Source address - will be inserted by firmware or use PIB setting
-  *p++ = 0x00;
-  *p++ = 0x00;
-
-  // Payload
+  *p++ = static_cast<uint8_t>(shortAddr_);
+  *p++ = static_cast<uint8_t>(shortAddr_ >> 8);
+  *p++ = static_cast<uint8_t>(txSeq_);
+  *p++ = kFlagAckReq;  // always request ACK for reliability
   memcpy(p, data, length);
-  p += length;
 
-  // Write complete frame to TX_REQ mailbox
-  const uint16_t totalLen = static_cast<uint16_t>(p - wire);
-  if (!device_.mailboxWrite(kMacMailboxTxReq, wire, totalLen)) return false;
-
-  txBusy_ = true;
-  txCfmReady_ = false;
+  retryCount_ = 0;
+  state_ = State::CcaBackoff;
+  stateTimer_ = millis();
   return true;
 }
 
-bool G3Mac::poll() {
-  uint8_t status[8];
-  MailboxInfo info;
+void G3Mac::poll() {
+  // --- 1. Check for incoming data from PHY ---
+  if (phy_.available()) {
+    uint8_t raw[PL460::kMaxMailboxPayload];
+    G3RxInfo phyInfo;
+    uint16_t rawLen = phy_.receive(raw, sizeof(raw), &phyInfo);
 
-  if (!device_.mailboxRead(kMacMailboxStatusInfo, status, sizeof(status), &info)) {
-    return false;
-  }
+    if (rawLen >= kHeaderSize) {
+      const uint16_t frameDst = static_cast<uint16_t>(raw[0]) |
+                                (static_cast<uint16_t>(raw[1]) << 8);
+      const uint16_t frameSrc = static_cast<uint16_t>(raw[2]) |
+                                (static_cast<uint16_t>(raw[3]) << 8);
+      const uint8_t frameSeq = raw[4];
+      const uint8_t flags = raw[5];
+      const uint16_t payloadLen = rawLen - kHeaderSize;
 
-  const uint16_t flags = info.flags;
+      if (flags & kFlagAck) {
+        // --- ACK frame ---
+        // Match against pending TX by destination address and sequence
+        if (state_ == State::WaitAck &&
+            frameDst == shortAddr_ &&   // ACK addressed to us
+            frameSrc == dstAddr_ &&     // from our destination
+            frameSeq == txSeq_ &&       // matching sequence
+            retryCount_ <= maxRetries_) {
+          // ACK match!
+          txCfm_.status = MacTxStatus::Success;
+          txCfm_.retries = retryCount_;
+          txCfmReady_ = true;
+          state_ = State::Idle;
+        }
+        // Don't forward ACK frames to the application
+        return;
+      }
 
-  // TX confirmation
-  if (flags & kMacFlagTxCfm) {
-    uint8_t wire[16];
-    if (device_.mailboxRead(kMacMailboxTxCfm, wire, sizeof(wire))) {
-      // Format varies by firmware version; common:
-      // [RMS_LO][RMS_HI][TIME_0..3][STATUS][...]
-      lastTxCfm_.rms = static_cast<uint32_t>(wire[0]) |
-                       (static_cast<uint32_t>(wire[1]) << 8);
-      lastTxCfm_.endTime = static_cast<uint32_t>(wire[2]) |
-                           (static_cast<uint32_t>(wire[3]) << 8) |
-                           (static_cast<uint32_t>(wire[4]) << 16) |
-                           (static_cast<uint32_t>(wire[5]) << 24);
-      lastTxCfm_.status = (wire[8] < 3)
-          ? static_cast<MacTxStatus>(wire[8])
-          : MacTxStatus::Invalid;
-    } else {
-      lastTxCfm_.status = MacTxStatus::Invalid;
-    }
-    txBusy_ = false;
-    txCfmReady_ = true;
-  }
+      // --- Data frame ---
+      // Check if addressed to us or broadcast
+      if (frameDst == shortAddr_ || frameDst == 0xFFFF) {
+        // Copy payload to RX buffer
+        const uint16_t copyLen = payloadLen < sizeof(rxBuffer_)
+            ? payloadLen : sizeof(rxBuffer_);
+        memcpy(rxBuffer_, raw + kHeaderSize, copyLen);
+        rxLength_ = copyLen;
+        rxInfo_.srcAddr = frameSrc;
+        rxInfo_.lqi = phyInfo.lqi;
+        rxInfo_.snr = phyInfo.snrPayload;
+        rxReady_ = true;
 
-  // Data indication (received frame)
-  if (flags & kMacFlagDataInd) {
-    uint8_t wire[PL460::kMaxMailboxPayload];
-    MailboxInfo indInfo;
-    if (device_.mailboxRead(kMacMailboxDataInd, wire, sizeof(wire), &indInfo)) {
-      // DATA_IND format: [frame_len_lo][frame_len_hi][MAC frame...]
-      const uint16_t frameLen = static_cast<uint16_t>(wire[0]) |
-                                (static_cast<uint16_t>(wire[1]) << 8);
-
-      const uint16_t copyLen = (frameLen > sizeof(rxBuffer_))
-          ? sizeof(rxBuffer_) : frameLen;
-      if (copyLen > 2) {
-        memcpy(rxBuffer_, wire + 2, copyLen - 2);
-        rxLength_ = copyLen - 2;
-
-        // Parse source address from MAC header (bytes 7-8)
-        if (rxLength_ >= 7) {
-          lastRxInfo_.srcAddr = static_cast<uint16_t>(rxBuffer_[6]) |
-                                (static_cast<uint16_t>(rxBuffer_[7]) << 8);
+        // Send ACK if requested
+        if (flags & kFlagAckReq) {
+          uint8_t ack[6];
+          ack[0] = static_cast<uint8_t>(frameSrc);   // dst = original sender
+          ack[1] = static_cast<uint8_t>(frameSrc >> 8);
+          ack[2] = static_cast<uint8_t>(shortAddr_); // src = us
+          ack[3] = static_cast<uint8_t>(shortAddr_ >> 8);
+          ack[4] = frameSeq;                         // same seq
+          ack[5] = kFlagAck;                         // this is an ACK
+          // Fire and forget — don't block on ACK delivery
+          (void)phy_.send(ack, sizeof(ack));
         }
       }
-      rxReady_ = true;
     }
   }
 
-  // RX parameters (LQI, SNR, RSSI)
-  if (flags & kMacFlagRxParInd) {
-    uint8_t wire[120];
-    if (device_.mailboxRead(kMacMailboxRxParInd, wire, sizeof(wire))) {
-      lastRxInfo_.lqi = wire[1];
-      if (sizeof(wire) > 7) {
-        lastRxInfo_.snrPayload = static_cast<int16_t>(
-            static_cast<uint16_t>(wire[6]) |
-            (static_cast<uint16_t>(wire[7]) << 8));
+  // --- 2. TX state machine ---
+  switch (state_) {
+    case State::Idle:
+      break;
+
+    case State::CcaBackoff:
+      // Wait for random backoff period, then check channel
+      if (millis() - stateTimer_ >= randomBackoff()) {
+        state_ = State::CcaWait;
+        stateTimer_ = millis();
       }
-    }
+      break;
+
+    case State::CcaWait:
+      // Clear channel assessment
+      if (device_.canTransmit()) {
+        // Channel clear — send frame
+        state_ = State::SendFrame;
+        stateTimer_ = millis();
+      } else {
+        // Channel busy — re-enter backoff or fail
+        if (++retryCount_ > kCcaRetryLimit) {
+          txCfm_.status = MacTxStatus::ChannelAccessFailure;
+          txCfm_.retries = retryCount_;
+          txCfmReady_ = true;
+          state_ = State::Idle;
+        } else {
+          state_ = State::CcaBackoff;
+          stateTimer_ = millis();
+        }
+      }
+      break;
+
+    case State::SendFrame:
+      // Send the frame over PHY
+      phy_.send(txPayload_, txLength_);
+      retryCount_ = 0;
+      state_ = State::WaitAck;
+      stateTimer_ = millis();
+      break;
+
+    case State::WaitAck:
+      if (millis() - stateTimer_ >= ackTimeoutMs_) {
+        // Timeout — no ACK received
+        if (++retryCount_ <= maxRetries_) {
+          // Retransmit
+          state_ = State::CcaBackoff;
+          stateTimer_ = millis();
+        } else {
+          txCfm_.status = MacTxStatus::NoAck;
+          txCfm_.retries = retryCount_;
+          txCfmReady_ = true;
+          state_ = State::Idle;
+        }
+      }
+      break;
   }
 
-  return true;
+  // 3. Consume PHY TX confirmation
+  if (phy_.transmissionComplete()) {
+    G3TxConfirm cfm;
+    (void)phy_.takeTxConfirm(cfm);
+  }
 }
 
 uint16_t G3Mac::receive(uint8_t *data, uint16_t capacity, MacRxInfo *info) {
   if (!rxReady_ || !data || !capacity) return 0;
-
   const uint16_t copyLen = capacity < rxLength_ ? capacity : rxLength_;
   memcpy(data, rxBuffer_, copyLen);
-  if (info) *info = lastRxInfo_;
-
+  if (info) *info = rxInfo_;
   rxReady_ = false;
   return copyLen;
 }
 
 MacTxConfirm G3Mac::takeTxConfirm() {
-  MacTxConfirm confirm = lastTxCfm_;
+  MacTxConfirm cfm = txCfm_;
   txCfmReady_ = false;
-  return confirm;
-}
-
-bool G3Mac::setShortAddress(uint16_t address) {
-  uint8_t value[2];
-  value[0] = static_cast<uint8_t>(address);
-  value[1] = static_cast<uint8_t>(address >> 8);
-  return device_.writeRegister(regAddr(kPibShortAddress), value, 2);
-}
-
-bool G3Mac::setPanId(uint16_t panId) {
-  uint8_t value[2];
-  value[0] = static_cast<uint8_t>(panId);
-  value[1] = static_cast<uint8_t>(panId >> 8);
-  return device_.writeRegister(regAddr(kPibPanId), value, 2);
-}
-
-bool G3Mac::setCoordinator(bool enable) {
-  uint8_t value = enable ? 1 : 0;
-  return device_.writeRegister(regAddr(kPibCoordinator), &value, 1);
+  return cfm;
 }
 
 }  // namespace pl460

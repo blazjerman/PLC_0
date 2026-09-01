@@ -60,6 +60,9 @@ class G3Phy {
   uint16_t receive(uint8_t *data, uint16_t capacity, G3RxInfo *info = nullptr);
   bool busy() const { return txBusy_; }
 
+  // Access the underlying PL460 device (for coupling config, etc.)
+  PL460 &device() { return device_; }
+
  private:
   static uint16_t getLe16(const uint8_t *p);
   static uint32_t getLe32(const uint8_t *p);

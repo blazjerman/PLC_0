@@ -1,110 +1,104 @@
 #pragma once
 
 #include "PL460.h"
+#include "PL460G3Phy.h"
 
 namespace pl460 {
 
-// MAC RT firmware mailbox IDs
-const uint16_t kMacMailboxStatusInfo     = 0;
-const uint16_t kMacMailboxSetCoord       = 1;
-const uint16_t kMacMailboxTxReq          = 2;
-const uint16_t kMacMailboxTxCfm          = 3;
-const uint16_t kMacMailboxDataInd        = 4;
-const uint16_t kMacMailboxCommStatus     = 6;
-const uint16_t kMacMailboxRxParInd       = 7;
-
-// Status event flags
-const uint16_t kMacFlagTxCfm       = 0x0001;
-const uint16_t kMacFlagDataInd     = 0x0002;
-const uint16_t kMacFlagCommStatus  = 0x0008;
-const uint16_t kMacFlagRxParInd    = 0x0010;
-
-// TX confirmation status codes
+// TX confirmation
 enum class MacTxStatus : uint8_t {
   Success = 0,
   ChannelAccessFailure = 1,
   NoAck = 2,
+  NoCarrier = 3,
   Invalid = 0xFF
 };
 
 struct MacTxConfirm {
   MacTxStatus status;
-  uint32_t endTime;
-  uint32_t rms;
+  uint8_t retries;
 };
 
 struct MacRxInfo {
   uint16_t srcAddr;
   uint8_t lqi;
-  int16_t snrPayload;
-  uint16_t rssi;
-  uint8_t modulation;
-  uint8_t correctedErrors;
+  int16_t snr;
 };
 
-// Register-based PIB IDs for MAC RT
-const uint16_t kMacRtShortAddress      = 0x403C;
-const uint16_t kMacRtPanId             = 0x403D;
-const uint16_t kMacRtCoordinator       = 0x403E;
-
+// Software G3 MAC layer over G3Phy.
+// Handles: CSMA/CA, addressing, ACK/NACK, retransmission, frame sequencing.
 class G3Mac {
  public:
-  explicit G3Mac(PL460 &device);
+  explicit G3Mac(G3Phy &phy);
 
-  // Simple init: boot firmware + configure addressing
-  // Use this instead of manual begin()+boot()+coupling+setAddresses
-  bool begin(const FirmwareImage &image,
-             uint16_t shortAddr,
-             uint16_t panId,
-             bool isCoordinator = false,
-             uint32_t bootTimeoutMs = 5000);
+  // Configure addressing. Must call before begin().
+  void setShortAddress(uint16_t addr) { shortAddr_ = addr; }
+  void setPanId(uint16_t panId) { panId_ = panId; }
 
-  // Advanced init: just initialize MAC state after manual setup
-  // Call this if you do the boot/coupling/addressing yourself
+  // Initialize MAC layer.
   bool begin();
 
-  // Send data to destination short address
-  // Returns false if hardware busy or args invalid.
-  // The MAC RT firmware handles ACK request, CSMA/CA, and retransmission.
+  // Send data to destination. Handles CSMA/CA + ACK + retry.
+  // Returns false if busy or invalid args.
   bool send(uint16_t dstAddr, const uint8_t *data, uint16_t length);
 
-  // Poll mailbox for events.  Call every loop iteration.
-  bool poll();
+  // Must call every loop iteration.
+  void poll();
 
-  // New data frame received?
+  // --- Status queries ---
+  bool busy() const { return state_ != State::Idle; }
   bool available() const { return rxReady_; }
-
-  // Copy received payload.  Returns length (0 on nothing available).
-  uint16_t receive(uint8_t *data, uint16_t capacity,
-                   MacRxInfo *info = nullptr);
-
-  // TX lifecycle
-  bool busy() const { return txBusy_; }
   bool transmissionComplete() const { return txCfmReady_; }
   MacTxConfirm takeTxConfirm();
 
-  // Addressing configuration
-  bool setShortAddress(uint16_t address);
-  bool setPanId(uint16_t panId);
-  bool setCoordinator(bool enable);
+  // Read received payload. Returns length copied.
+  uint16_t receive(uint8_t *data, uint16_t capacity, MacRxInfo *info = nullptr);
 
-  // Direct register access helpers (for PIB tweaks)
-  PL460 &device() { return device_; }
+  // --- Configuration ---
+  void setMaxRetries(uint8_t r) { maxRetries_ = r; }
+  void setAckTimeoutMs(uint16_t t) { ackTimeoutMs_ = t; }
 
  private:
-  static uint16_t getLe16(const uint8_t *p);
-  static uint32_t getLe32(const uint8_t *p);
+  enum class State : uint8_t {
+    Idle,
+    CcaWait,
+    CcaBackoff,
+    SendFrame,
+    WaitAck,
+  };
 
+  static uint16_t randomBackoff();
+
+  G3Phy &phy_;
   PL460 &device_;
 
-  bool txBusy_;
-  bool txCfmReady_;
-  bool rxReady_;
-  MacTxConfirm lastTxCfm_;
+  // Addressing
+  uint16_t shortAddr_ = 0xFFFF;
+  uint16_t panId_ = 0xFFFF;
+  uint8_t seqNum_ = 0;
 
+  // Config
+  uint8_t maxRetries_ = 3;
+  uint16_t ackTimeoutMs_ = 500;
+
+  // TX state machine
+  State state_ = State::Idle;
+  uint16_t dstAddr_ = 0;
+  uint8_t txPayload_[PL460::kMaxMailboxPayload];
+  uint16_t txLength_ = 0;
+  uint16_t txSeq_ = 0;
+  uint8_t retryCount_ = 0;
+  uint32_t stateTimer_ = 0;
+
+  // TX confirm
+  bool txCfmReady_ = false;
+  MacTxConfirm txCfm_;
+
+  // RX buffer
   uint8_t rxBuffer_[PL460::kMaxMailboxPayload];
-  uint16_t rxLength_;
-  MacRxInfo lastRxInfo_;
+  uint16_t rxLength_ = 0;
+  bool rxReady_ = false;
+  MacRxInfo rxInfo_;
 };
 
 }  // namespace pl460
